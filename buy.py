@@ -3,21 +3,37 @@ Amazon vs 楽天 最安振り分け計算
 ブラウザ実行版 / Streamlit
 
 実行方法:
-    pip install streamlit
+    pip install streamlit gspread google-auth requests
 
-Streamlit Cloud の Secrets に以下を設定:
+Streamlit Cloud の Secrets:
 
-    RAKUTEN_APP_ID = "あなたの楽天アプリケーションID"
-    RAKUTEN_ACCESS_KEY = "あなたの楽天アクセスキー"
-    RAKUTEN_REFERER = "楽天APIに登録したURL"
+RAKUTEN_APP_ID = "あなたの楽天アプリケーションID"
+RAKUTEN_ACCESS_KEY = "あなたの楽天アクセスキー"
+RAKUTEN_REFERER = "楽天APIに登録したURL"
+
+GOOGLE_SHEET_ID = "GoogleスプレッドシートID"
+
+[gcp_service_account]
+type = "service_account"
+project_id = "..."
+private_key_id = "..."
+private_key = "..."
+client_email = "..."
+client_id = "..."
+token_uri = "https://oauth2.googleapis.com/token"
 
 ローカルで実行:
     streamlit run buy.py
 
 ※楽天APIの認証情報はアプリ画面には表示されません。
-※保存JSONにも楽天APIの認証情報は保存されません。
+※楽天APIの認証情報はGoogle Sheetsにも保存されません。
+※商品データ・設定はGoogle Sheetsに保存されます。
 """
 
+
+# ===========================================================================
+# import
+# ===========================================================================
 
 import os
 import re
@@ -27,9 +43,11 @@ import urllib.request
 import urllib.error
 
 from itertools import product
-from pathlib import Path
 
 import streamlit as st
+import gspread
+
+from google.oauth2.service_account import Credentials
 
 
 # ===========================================================================
@@ -46,20 +64,23 @@ st.set_page_config(
 # ===========================================================================
 # 楽天API設定
 # ===========================================================================
-#
+
 # 優先順位:
 #   1. Streamlit Cloud Secrets
 #   2. 環境変数
 #
 # Secretsの内容は画面に表示しない。
-#
-# ---------------------------------------------------------------------------
+# ===========================================================================
 
-def get_secret_or_env(name: str, default: str = "") -> str:
+
+def get_secret_or_env(
+    name: str,
+    default: str = "",
+) -> str:
     """
     Streamlit Secretsから値を取得する。
 
-    Streamlit Cloudでは st.secrets を使用する。
+    Streamlit Cloudではst.secretsを使用する。
     ローカル環境などでSecretsがない場合は環境変数を使用する。
 
     取得した値を画面には表示しない。
@@ -69,7 +90,7 @@ def get_secret_or_env(name: str, default: str = "") -> str:
 
         value = st.secrets.get(
             name,
-            None
+            None,
         )
 
         if value is not None:
@@ -84,7 +105,7 @@ def get_secret_or_env(name: str, default: str = "") -> str:
 
     return os.environ.get(
         name,
-        default
+        default,
     ).strip()
 
 
@@ -108,22 +129,720 @@ RAKUTEN_API_URL = (
 
 
 # ===========================================================================
-# 保存ファイル
+# Google Sheets設定
 # ===========================================================================
 
-# buy.py と同じフォルダに保存
-SAVE_FILE = Path(
-    __file__
-).resolve().with_name(
-    "buy_saved_data.json"
+GOOGLE_SHEET_ID = get_secret_or_env(
+    "GOOGLE_SHEET_ID"
 )
+
+PRODUCTS_SHEET_NAME = "products"
+
+SETTINGS_SHEET_NAME = "settings"
+
+
+# Google Sheetsの商品列
+PRODUCT_COLUMNS = [
+    "name",
+    "ap",
+    "apt",
+    "baby",
+    "rp",
+    "rpt",
+    "rurl",
+]
+
+
+# Google Sheetsの設定項目
+SETTING_KEYS = [
+    "max_shops",
+    "min_shop_price",
+    "bonus_cap",
+    "spu_multiplier",
+]
+
+
+# ===========================================================================
+# Google Sheets接続
+# ===========================================================================
+
+
+@st.cache_resource
+def get_google_client():
+    """
+    Streamlit Secretsの[gcp_service_account]を使って
+    Google Sheetsへ接続する。
+
+    注意:
+    楽天APIの認証情報とは完全に別。
+    """
+
+    try:
+
+        service_account_info = dict(
+            st.secrets["gcp_service_account"]
+        )
+
+    except Exception as e:
+
+        raise RuntimeError(
+            "Streamlit Secretsに"
+            "[gcp_service_account]が設定されていません。"
+        ) from e
+
+    scopes = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive",
+    ]
+
+    try:
+
+        credentials = (
+            Credentials.from_service_account_info(
+                service_account_info,
+                scopes=scopes,
+            )
+        )
+
+    except Exception as e:
+
+        raise RuntimeError(
+            "gcp_service_accountの設定が正しくありません。"
+        ) from e
+
+    return gspread.authorize(
+        credentials
+    )
+
+
+def get_google_spreadsheet():
+    """
+    Googleスプレッドシートを取得する。
+    """
+
+    if not GOOGLE_SHEET_ID:
+
+        raise RuntimeError(
+            "GOOGLE_SHEET_IDが"
+            "Streamlit Secretsに設定されていません。"
+        )
+
+    client = get_google_client()
+
+    try:
+
+        return client.open_by_key(
+            GOOGLE_SHEET_ID
+        )
+
+    except Exception as e:
+
+        raise RuntimeError(
+            "Googleスプレッドシートを開けませんでした。\n\n"
+            "以下を確認してください。\n"
+            "・GOOGLE_SHEET_IDが正しい\n"
+            "・サービスアカウントにスプレッドシートを共有している\n"
+            "・サービスアカウントに編集権限がある"
+        ) from e
+
+
+def get_or_create_worksheet(
+    spreadsheet,
+    title,
+    rows=100,
+    cols=20,
+):
+    """
+    ワークシートを取得。
+    存在しなければ作成する。
+    """
+
+    try:
+
+        return spreadsheet.worksheet(
+            title
+        )
+
+    except gspread.WorksheetNotFound:
+
+        return spreadsheet.add_worksheet(
+            title=title,
+            rows=rows,
+            cols=cols,
+        )
+
+
+# ===========================================================================
+# Google Sheets保存用データ作成
+# ===========================================================================
+
+
+def create_products_sheet_values():
+    """
+    商品データをGoogle Sheetsへ保存するための2次元配列を作る。
+    """
+
+    values = [
+        PRODUCT_COLUMNS
+    ]
+
+    for item in st.session_state.products:
+
+        values.append([
+            item.get(
+                "name",
+                "",
+            ),
+
+            int(
+                item.get(
+                    "ap",
+                    0,
+                )
+            ),
+
+            int(
+                item.get(
+                    "apt",
+                    1,
+                )
+            ),
+
+            bool(
+                item.get(
+                    "baby",
+                    False,
+                )
+            ),
+
+            int(
+                item.get(
+                    "rp",
+                    0,
+                )
+            ),
+
+            int(
+                item.get(
+                    "rpt",
+                    0,
+                )
+            ),
+
+            item.get(
+                "rurl",
+                "",
+            ),
+        ])
+
+    return values
+
+
+def create_settings_sheet_values():
+    """
+    設定をGoogle Sheetsへ保存するための2次元配列を作る。
+    """
+
+    return [
+        [
+            "setting",
+            "value",
+        ],
+
+        [
+            "max_shops",
+            int(
+                st.session_state.get(
+                    "max_shops",
+                    10,
+                )
+            ),
+        ],
+
+        [
+            "min_shop_price",
+            int(
+                st.session_state.get(
+                    "min_shop_price",
+                    1000,
+                )
+            ),
+        ],
+
+        [
+            "bonus_cap",
+            int(
+                st.session_state.get(
+                    "bonus_cap",
+                    7000,
+                )
+            ),
+        ],
+
+        [
+            "spu_multiplier",
+            int(
+                st.session_state.get(
+                    "spu_multiplier",
+                    0,
+                )
+            ),
+        ],
+    ]
+
+
+# ===========================================================================
+# Google Sheets保存
+# ===========================================================================
+
+
+def save_data():
+    """
+    商品データと設定をGoogle Sheetsへ保存する。
+
+    楽天API認証情報は絶対に保存しない。
+    """
+
+    spreadsheet = get_google_spreadsheet()
+
+    # -----------------------------------------------------------------------
+    # productsシート
+    # -----------------------------------------------------------------------
+
+    products_ws = get_or_create_worksheet(
+        spreadsheet,
+        PRODUCTS_SHEET_NAME,
+        rows=100,
+        cols=len(PRODUCT_COLUMNS),
+    )
+
+    products_values = (
+        create_products_sheet_values()
+    )
+
+    # 一度シート全体をクリア
+    products_ws.clear()
+
+    # A1から一括書き込み
+    products_ws.update(
+        range_name="A1",
+        values=products_values,
+    )
+
+    # -----------------------------------------------------------------------
+    # settingsシート
+    # -----------------------------------------------------------------------
+
+    settings_ws = get_or_create_worksheet(
+        spreadsheet,
+        SETTINGS_SHEET_NAME,
+        rows=20,
+        cols=2,
+    )
+
+    settings_values = (
+        create_settings_sheet_values()
+    )
+
+    settings_ws.clear()
+
+    settings_ws.update(
+        range_name="A1",
+        values=settings_values,
+    )
+
+
+# ===========================================================================
+# Google Sheets読み込み
+# ===========================================================================
+
+
+def to_int(
+    value,
+    default=0,
+):
+    """
+    Google Sheetsから取得した値を安全にintへ変換。
+    """
+
+    try:
+
+        if value is None:
+            return default
+
+        if isinstance(
+            value,
+            bool,
+        ):
+
+            return (
+                1
+                if value
+                else 0
+            )
+
+        text = str(
+            value
+        ).strip()
+
+        if not text:
+            return default
+
+        text = (
+            text
+            .replace(
+                ",",
+                "",
+            )
+            .replace(
+                "円",
+                "",
+            )
+            .replace(
+                "%",
+                "",
+            )
+            .strip()
+        )
+
+        return int(
+            float(text)
+        )
+
+    except Exception:
+
+        return default
+
+
+def to_bool(
+    value,
+    default=False,
+):
+    """
+    Google Sheetsから取得した値を安全にboolへ変換。
+    """
+
+    if isinstance(
+        value,
+        bool,
+    ):
+
+        return value
+
+    if isinstance(
+        value,
+        (int, float),
+    ):
+
+        return bool(
+            value
+        )
+
+    text = str(
+        value
+    ).strip().lower()
+
+    if text in [
+        "true",
+        "1",
+        "yes",
+        "y",
+        "on",
+        "はい",
+    ]:
+
+        return True
+
+    if text in [
+        "false",
+        "0",
+        "no",
+        "n",
+        "off",
+        "いいえ",
+        "",
+    ]:
+
+        return False
+
+    return default
+
+
+def load_data():
+    """
+    Google Sheetsから商品・設定を読み込む。
+
+    読み込み後はwidget_versionを変更して、
+    Streamlitの古いウィジェット値が残らないようにする。
+    """
+
+    spreadsheet = (
+        get_google_spreadsheet()
+    )
+
+    # -----------------------------------------------------------------------
+    # products
+    # -----------------------------------------------------------------------
+
+    try:
+
+        products_ws = (
+            spreadsheet.worksheet(
+                PRODUCTS_SHEET_NAME
+            )
+        )
+
+    except gspread.WorksheetNotFound:
+
+        # productsが存在しない場合は
+        # デフォルト商品を1件作る。
+
+        st.session_state.products = [
+            {
+                "name": "",
+                "ap": 0,
+                "apt": 1,
+                "baby": False,
+                "rp": 0,
+                "rpt": 0,
+                "rurl": "",
+            }
+        ]
+
+    else:
+
+        rows = (
+            products_ws.get_all_records()
+        )
+
+        loaded_products = []
+
+        for row in rows:
+
+            # ヘッダー行などを除外
+            # name等が全部空なら読み込まない
+
+            name = str(
+                row.get(
+                    "name",
+                    "",
+                )
+            )
+
+            ap = to_int(
+                row.get(
+                    "ap",
+                    0,
+                )
+            )
+
+            apt = to_int(
+                row.get(
+                    "apt",
+                    1,
+                ),
+                default=1,
+            )
+
+            baby = to_bool(
+                row.get(
+                    "baby",
+                    False,
+                )
+            )
+
+            rp = to_int(
+                row.get(
+                    "rp",
+                    0,
+                )
+            )
+
+            rpt = to_int(
+                row.get(
+                    "rpt",
+                    0,
+                )
+            )
+
+            rurl = str(
+                row.get(
+                    "rurl",
+                    "",
+                )
+            )
+
+            # 完全な空行は除外
+            if (
+                not name.strip()
+                and ap == 0
+                and rp == 0
+                and not rurl.strip()
+            ):
+
+                continue
+
+            loaded_products.append(
+                {
+                    "name": name,
+                    "ap": ap,
+                    "apt": apt,
+                    "baby": baby,
+                    "rp": rp,
+                    "rpt": rpt,
+                    "rurl": rurl,
+                }
+            )
+
+        if loaded_products:
+
+            st.session_state.products = (
+                loaded_products
+            )
+
+        else:
+
+            st.session_state.products = [
+                {
+                    "name": "",
+                    "ap": 0,
+                    "apt": 1,
+                    "baby": False,
+                    "rp": 0,
+                    "rpt": 0,
+                    "rurl": "",
+                }
+            ]
+
+    # -----------------------------------------------------------------------
+    # settings
+    # -----------------------------------------------------------------------
+
+    try:
+
+        settings_ws = (
+            spreadsheet.worksheet(
+                SETTINGS_SHEET_NAME
+            )
+        )
+
+    except gspread.WorksheetNotFound:
+
+        # 設定シートが存在しない場合は
+        # デフォルト値を使用。
+
+        st.session_state.max_shops = 10
+        st.session_state.min_shop_price = 1000
+        st.session_state.bonus_cap = 7000
+        st.session_state.spu_multiplier = 0
+
+    else:
+
+        settings_rows = (
+            settings_ws.get_all_records()
+        )
+
+        setting_dict = {}
+
+        for row in settings_rows:
+
+            key = str(
+                row.get(
+                    "setting",
+                    "",
+                )
+            ).strip()
+
+            value = row.get(
+                "value",
+                "",
+            )
+
+            if key:
+
+                setting_dict[key] = value
+
+        st.session_state.max_shops = (
+            to_int(
+                setting_dict.get(
+                    "max_shops",
+                    10,
+                ),
+                default=10,
+            )
+        )
+
+        st.session_state.min_shop_price = (
+            to_int(
+                setting_dict.get(
+                    "min_shop_price",
+                    1000,
+                ),
+                default=1000,
+            )
+        )
+
+        st.session_state.bonus_cap = (
+            to_int(
+                setting_dict.get(
+                    "bonus_cap",
+                    7000,
+                ),
+                default=7000,
+            )
+        )
+
+        st.session_state.spu_multiplier = (
+            to_int(
+                setting_dict.get(
+                    "spu_multiplier",
+                    0,
+                ),
+                default=0,
+            )
+        )
+
+    # -----------------------------------------------------------------------
+    # ウィジェット世代を変更
+    # -----------------------------------------------------------------------
+    #
+    # これが非常に重要。
+    #
+    # Streamlitでは、
+    #
+    #   number_input
+    #   text_input
+    #   checkbox
+    #
+    # などにkeyを設定すると、そのウィジェットの値が
+    # session_stateに保持される。
+    #
+    # Google Sheetsから読み込んだだけでは、
+    # 古いwidgetの値が残ってしまう場合がある。
+    #
+    # そこでwidget_versionを変更して、
+    # 新しいkeyのウィジェットを生成する。
+    # -----------------------------------------------------------------------
+
+    st.session_state.widget_version = (
+        int(
+            st.session_state.get(
+                "widget_version",
+                0,
+            )
+        )
+        + 1
+    )
 
 
 # ===========================================================================
 # 楽天API
 # ===========================================================================
 
-def extract_rakuten_item_code(url: str) -> str:
+
+def extract_rakuten_item_code(
+    url: str,
+) -> str:
     """
     楽天商品URLからitemCodeを作成する。
     """
@@ -144,12 +863,17 @@ def extract_rakuten_item_code(url: str) -> str:
             "楽天の商品URLとして認識できません"
         )
 
-    return f"{parts[0]}:{parts[1]}"
+    return (
+        f"{parts[0]}:{parts[1]}"
+    )
 
 
-def extract_shop_and_slug(url: str):
+def extract_shop_and_slug(
+    url: str,
+):
     """
-    楽天商品URLからショップコードと商品コード部分を取得する。
+    楽天商品URLからショップコードと
+    商品コード部分を取得する。
     """
 
     path = urllib.parse.urlparse(
@@ -168,7 +892,10 @@ def extract_shop_and_slug(url: str):
             "楽天の商品URLとして認識できません"
         )
 
-    return parts[0], parts[1]
+    return (
+        parts[0],
+        parts[1],
+    )
 
 
 def _call_rakuten_api(
@@ -192,7 +919,7 @@ def _call_rakuten_api(
         f"{RAKUTEN_API_URL}?"
         f"{urllib.parse.urlencode(params)}",
         headers={
-            "Origin": referer
+            "Origin": referer,
         },
     )
 
@@ -200,7 +927,7 @@ def _call_rakuten_api(
 
         with urllib.request.urlopen(
             req,
-            timeout=10
+            timeout=10,
         ) as res:
 
             return json.loads(
@@ -213,7 +940,7 @@ def _call_rakuten_api(
 
         body = e.read().decode(
             "utf-8",
-            errors="ignore"
+            errors="ignore",
         )
 
         try:
@@ -224,13 +951,19 @@ def _call_rakuten_api(
 
             errs = err.get(
                 "errors",
-                err
+                err,
             )
 
             msg = (
-                errs.get("errorMessage")
-                or errs.get("error_description")
-                or errs.get("error")
+                errs.get(
+                    "errorMessage"
+                )
+                or errs.get(
+                    "error_description"
+                )
+                or errs.get(
+                    "error"
+                )
                 or body
             )
 
@@ -247,16 +980,20 @@ def fetch_rakuten_price_and_point(
     url: str,
 ):
     """
-    楽天の商品URLから価格とポイント還元率を取得する。
+    楽天の商品URLから価格と
+    ポイント還元率を取得する。
 
-    楽天APIの認証情報はStreamlit Secretsから取得する。
+    楽天APIの認証情報は
+    Streamlit Secretsから取得する。
+
     アプリ画面からは入力・編集できない。
 
     戻り値:
         price
         point_rate
 
-    ※ここでは楽天APIから取得した生の還元率を返す。
+    ※ここでは楽天APIから取得した
+      生の還元率を返す。
     """
 
     app_id = (
@@ -271,10 +1008,14 @@ def fetch_rakuten_price_and_point(
         RAKUTEN_REFERER or ""
     ).strip()
 
-    if not app_id or not access_key:
+    if (
+        not app_id
+        or not access_key
+    ):
 
         raise RuntimeError(
-            "楽天APIの認証情報がStreamlit Secretsに設定されていません。"
+            "楽天APIの認証情報が"
+            "Streamlit Secretsに設定されていません。"
         )
 
     if not referer:
@@ -302,7 +1043,7 @@ def fetch_rakuten_price_and_point(
 
         data = _call_rakuten_api(
             {
-                "itemCode": item_code
+                "itemCode": item_code,
             },
             app_id,
             access_key,
@@ -311,7 +1052,7 @@ def fetch_rakuten_price_and_point(
 
         items = data.get(
             "Items",
-            []
+            [],
         )
 
         if items:
@@ -326,7 +1067,7 @@ def fetch_rakuten_price_and_point(
                     float(
                         item.get(
                             "pointRate",
-                            1
+                            1,
                         )
                     )
                 ),
@@ -375,12 +1116,13 @@ def fetch_rakuten_price_and_point(
     except RuntimeError as e:
 
         raise RuntimeError(
-            f"楽天APIエラー（{item_code}）: {e}"
+            f"楽天APIエラー"
+            f"（{item_code}）: {e}"
         ) from None
 
     items = data.get(
         "Items",
-        []
+        [],
     )
 
     if not items:
@@ -401,7 +1143,7 @@ def fetch_rakuten_price_and_point(
             float(
                 item.get(
                     "pointRate",
-                    1
+                    1,
                 )
             )
         ),
@@ -411,6 +1153,7 @@ def fetch_rakuten_price_and_point(
 # ===========================================================================
 # 金額計算
 # ===========================================================================
+
 
 def tax_excluded_price(
     price,
@@ -449,12 +1192,16 @@ def amazon_cost(item):
         )
     )
 
-    return price, points
+    return (
+        price,
+        points,
+    )
 
 
 # ===========================================================================
 # 楽天買いまわり
 # ===========================================================================
+
 
 def calculate_rakuten_shop_count(
     items,
@@ -476,7 +1223,10 @@ def calculate_rakuten_shop_count(
         if choice != "R":
             continue
 
-        if item["rp"] >= min_shop_price:
+        if (
+            item["rp"]
+            >= min_shop_price
+        ):
 
             eligible += 1
 
@@ -537,6 +1287,7 @@ def calculate_rakuten_bonus(
 # ===========================================================================
 # 総合計算
 # ===========================================================================
+
 
 def evaluate(
     items,
@@ -648,13 +1399,19 @@ def evaluate(
             net,
 
         "shop_count":
-            rakuten_info["shop_count"],
+            rakuten_info[
+                "shop_count"
+            ],
 
         "bonus_multiplier":
-            rakuten_info["bonus_multiplier"],
+            rakuten_info[
+                "bonus_multiplier"
+            ],
 
         "bonus":
-            rakuten_info["bonus"],
+            rakuten_info[
+                "bonus"
+            ],
 
         "total_points":
             total_points,
@@ -684,6 +1441,7 @@ def evaluate(
 # ===========================================================================
 # 最適解探索
 # ===========================================================================
+
 
 def find_best(
     items,
@@ -733,6 +1491,7 @@ def find_best(
 # 表示用関数
 # ===========================================================================
 
+
 def yen(v):
     """
     円表示。
@@ -749,81 +1508,10 @@ def point(v):
     return f"{round(v):,}pt"
 
 
-def get_product_multiplier(
-    item,
-    choice,
-    spu_multiplier,
-    buyaround_multiplier,
-    min_shop_price,
-):
-    """
-    商品ごとの還元倍率を返す。
-
-    Amazon:
-        商品のAmazon還元率
-
-    楽天:
-        商品ポイント
-        + SPU
-        + 買いまわり
-    """
-
-    if choice == "A":
-
-        total = int(
-            item["apt"]
-        )
-
-        detail = (
-            f"{item['apt']}"
-        )
-
-        return total, detail
-
-    # -----------------------------------------------------------------------
-    # 楽天
-    # -----------------------------------------------------------------------
-
-    product_rate = int(
-        item["rpt"]
-    )
-
-    spu_rate = int(
-        spu_multiplier
-    )
-
-    is_eligible = (
-        item["rp"]
-        >= min_shop_price
-    )
-
-    buyaround_rate = (
-        int(
-            buyaround_multiplier
-        )
-        if is_eligible
-        else 0
-    )
-
-    total = (
-        product_rate
-        + spu_rate
-        + buyaround_rate
-    )
-
-    detail = (
-        f"{total}"
-        f"({product_rate}"
-        f"+{spu_rate}"
-        f"+{buyaround_rate})"
-    )
-
-    return total, detail
-
-
 # ===========================================================================
 # 商品ごとのポイント計算
 # ===========================================================================
+
 
 def calculate_item_results(
     items,
@@ -843,14 +1531,6 @@ def calculate_item_results(
 
     楽天買いまわりポイントは、
     全楽天商品の税抜価格に応じて比例配分する。
-
-    これにより、
-
-        商品ごとの還元ポイント合計
-        =
-        全体のポイント合計
-
-    となる。
     """
 
     results = []
@@ -959,9 +1639,9 @@ def calculate_item_results(
                 )
             )
 
-            # ---------------------------------------------------------------
+            # ----------------------------------------------------------------
             # 商品ポイント + SPU
-            # ---------------------------------------------------------------
+            # ----------------------------------------------------------------
 
             product_rate = float(
                 item["rpt"]
@@ -980,13 +1660,9 @@ def calculate_item_results(
                 / 100
             )
 
-            # ---------------------------------------------------------------
+            # ----------------------------------------------------------------
             # 買いまわりポイント
-            #
-            # 現在の全体計算ロジックでは、
-            # 楽天購入商品の税抜合計を基準にしているため、
-            # 各楽天商品の税抜価格に比例して配分する。
-            # ---------------------------------------------------------------
+            # ----------------------------------------------------------------
 
             buyaround_points = 0.0
 
@@ -1065,288 +1741,9 @@ def calculate_item_results(
 
 
 # ===========================================================================
-# 保存・読み込み
-# ===========================================================================
-
-def create_save_data():
-    """
-    現在の設定・商品データを保存用辞書にする。
-
-    ★楽天API認証情報は保存しない。
-    """
-
-    return {
-        "version": 2,
-
-        "settings": {
-            "max_shops": int(
-                st.session_state.get(
-                    "max_shops",
-                    10,
-                )
-            ),
-
-            "min_shop_price": int(
-                st.session_state.get(
-                    "min_shop_price",
-                    1000,
-                )
-            ),
-
-            "bonus_cap": int(
-                st.session_state.get(
-                    "bonus_cap",
-                    7000,
-                )
-            ),
-
-            "spu_multiplier": int(
-                st.session_state.get(
-                    "spu_multiplier",
-                    0,
-                )
-            ),
-        },
-
-        "products": [
-            {
-                "name": item.get(
-                    "name",
-                    ""
-                ),
-
-                "ap": int(
-                    item.get(
-                        "ap",
-                        0
-                    )
-                ),
-
-                "apt": int(
-                    item.get(
-                        "apt",
-                        1
-                    )
-                ),
-
-                "baby": bool(
-                    item.get(
-                        "baby",
-                        False
-                    )
-                ),
-
-                "rp": int(
-                    item.get(
-                        "rp",
-                        0
-                    )
-                ),
-
-                "rpt": int(
-                    item.get(
-                        "rpt",
-                        0
-                    )
-                ),
-
-                "rurl": item.get(
-                    "rurl",
-                    ""
-                ),
-            }
-
-            for item
-            in st.session_state.products
-        ],
-    }
-
-
-def save_data():
-    """
-    設定・商品データをJSONに保存する。
-
-    楽天API認証情報は保存しない。
-    """
-
-    data = create_save_data()
-
-    with open(
-        SAVE_FILE,
-        "w",
-        encoding="utf-8",
-    ) as f:
-
-        json.dump(
-            data,
-            f,
-            ensure_ascii=False,
-            indent=2,
-        )
-
-
-def load_data():
-    """
-    JSONから設定・商品データを読み込む。
-
-    楽天API認証情報はSecretsから取得するため、
-    保存JSONからは読み込まない。
-    """
-
-    if not SAVE_FILE.exists():
-
-        raise FileNotFoundError(
-            f"保存ファイルがありません："
-            f"{SAVE_FILE.name}"
-        )
-
-    with open(
-        SAVE_FILE,
-        "r",
-        encoding="utf-8",
-    ) as f:
-
-        data = json.load(
-            f
-        )
-
-    settings = data.get(
-        "settings",
-        {}
-    )
-
-    products = data.get(
-        "products",
-        []
-    )
-
-    # -----------------------------------------------------------------------
-    # 設定
-    # -----------------------------------------------------------------------
-
-    st.session_state.max_shops = int(
-        settings.get(
-            "max_shops",
-            10
-        )
-    )
-
-    st.session_state.min_shop_price = int(
-        settings.get(
-            "min_shop_price",
-            1000
-        )
-    )
-
-    st.session_state.bonus_cap = int(
-        settings.get(
-            "bonus_cap",
-            7000
-        )
-    )
-
-    st.session_state.spu_multiplier = int(
-        settings.get(
-            "spu_multiplier",
-            0
-        )
-    )
-
-    # -----------------------------------------------------------------------
-    # 商品
-    # -----------------------------------------------------------------------
-
-    loaded_products = []
-
-    for item in products:
-
-        loaded_products.append(
-            {
-                "name": item.get(
-                    "name",
-                    ""
-                ),
-
-                "ap": int(
-                    item.get(
-                        "ap",
-                        0
-                    )
-                ),
-
-                "apt": int(
-                    item.get(
-                        "apt",
-                        1
-                    )
-                ),
-
-                "baby": bool(
-                    item.get(
-                        "baby",
-                        False
-                    )
-                ),
-
-                "rp": int(
-                    item.get(
-                        "rp",
-                        0
-                    )
-                ),
-
-                "rpt": int(
-                    item.get(
-                        "rpt",
-                        0
-                    )
-                ),
-
-                "rurl": item.get(
-                    "rurl",
-                    ""
-                ),
-            }
-        )
-
-    if loaded_products:
-
-        st.session_state.products = (
-            loaded_products
-        )
-
-    else:
-
-        st.session_state.products = [
-            {
-                "name": "",
-                "ap": 0,
-                "apt": 1,
-                "baby": False,
-                "rp": 0,
-                "rpt": 0,
-                "rurl": "",
-            }
-        ]
-
-    # -----------------------------------------------------------------------
-    # widget世代を変更
-    # -----------------------------------------------------------------------
-
-    st.session_state.widget_version = (
-        int(
-            st.session_state.get(
-                "widget_version",
-                0
-            )
-        )
-        + 1
-    )
-
-
-# ===========================================================================
 # 初期値
 # ===========================================================================
+
 
 if "products" not in st.session_state:
 
@@ -1403,6 +1800,7 @@ if "spu_multiplier" not in st.session_state:
 # タイトル
 # ===========================================================================
 
+
 st.title(
     "🛒 Amazon × 楽天 最安振り分け計算"
 )
@@ -1414,8 +1812,18 @@ st.caption(
 
 
 # ===========================================================================
-# 保存データ読み込み
+# Google Sheets読み込み処理
 # ===========================================================================
+#
+# ボタンを押した直後の通常のStreamlit再実行では、
+# 先にこの部分を処理してから商品ウィジェットを生成する。
+#
+# これにより、
+# Google Sheets → session_state → 新しいwidget
+#
+# の順番になる。
+# ===========================================================================
+
 
 if st.session_state.pop(
     "load_requested",
@@ -1430,19 +1838,78 @@ if st.session_state.pop(
             "load_success"
         ] = True
 
-    except FileNotFoundError as e:
-
-        st.session_state[
-            "load_error"
-        ] = str(e)
-
     except Exception as e:
 
         st.session_state[
             "load_error"
         ] = (
+            f"Google Sheetsからの"
             f"読み込みに失敗しました：{e}"
         )
+
+
+# ===========================================================================
+# 保存成功メッセージ
+# ===========================================================================
+
+
+if st.session_state.pop(
+    "save_success",
+    False,
+):
+
+    st.success(
+        "Google Sheetsへ保存しました。"
+    )
+
+
+if st.session_state.pop(
+    "save_error",
+    False,
+):
+
+    error_message = (
+        st.session_state.pop(
+            "save_error_message",
+            "保存に失敗しました。",
+        )
+    )
+
+    st.error(
+        error_message
+    )
+
+
+# ===========================================================================
+# 読み込み成功メッセージ
+# ===========================================================================
+
+
+if st.session_state.pop(
+    "load_success",
+    False,
+):
+
+    st.success(
+        "Google Sheetsから読み込みました。"
+    )
+
+
+if st.session_state.pop(
+    "load_error",
+    False,
+):
+
+    error_message = (
+        st.session_state.pop(
+            "load_error_message",
+            "読み込みに失敗しました。",
+        )
+    )
+
+    st.error(
+        error_message
+    )
 
 
 # ===========================================================================
@@ -1450,15 +1917,17 @@ if st.session_state.pop(
 # ===========================================================================
 #
 # 楽天APIの認証情報はここには表示しない。
-#
 # ===========================================================================
+
 
 with st.expander(
     "⚙️ 設定（楽天買いまわり）",
     expanded=False,
 ):
 
-    v = st.session_state.widget_version
+    v = (
+        st.session_state.widget_version
+    )
 
     c1, c2, c3, c4 = st.columns(
         4
@@ -1466,7 +1935,7 @@ with st.expander(
 
     with c1:
 
-        st.session_state.max_shops = (
+        max_shops_value = (
             st.number_input(
                 "買いまわり最大ショップ数",
                 min_value=1,
@@ -1476,13 +1945,21 @@ with st.expander(
                 ),
                 step=1,
                 format="%d",
-                key=f"max_shops_widget_{v}",
+                key=(
+                    f"max_shops_widget_{v}"
+                ),
+            )
+        )
+
+        st.session_state.max_shops = (
+            int(
+                max_shops_value
             )
         )
 
     with c2:
 
-        st.session_state.min_shop_price = (
+        min_shop_price_value = (
             st.number_input(
                 "買いまわり対象最低金額（税込）",
                 min_value=0,
@@ -1491,13 +1968,21 @@ with st.expander(
                 ),
                 step=100,
                 format="%d",
-                key=f"min_shop_price_widget_{v}",
+                key=(
+                    f"min_shop_price_widget_{v}"
+                ),
+            )
+        )
+
+        st.session_state.min_shop_price = (
+            int(
+                min_shop_price_value
             )
         )
 
     with c3:
 
-        st.session_state.bonus_cap = (
+        bonus_cap_value = (
             st.number_input(
                 "買いまわり特典ポイント上限",
                 min_value=0,
@@ -1506,13 +1991,21 @@ with st.expander(
                 ),
                 step=100,
                 format="%d",
-                key=f"bonus_cap_widget_{v}",
+                key=(
+                    f"bonus_cap_widget_{v}"
+                ),
+            )
+        )
+
+        st.session_state.bonus_cap = (
+            int(
+                bonus_cap_value
             )
         )
 
     with c4:
 
-        st.session_state.spu_multiplier = (
+        spu_multiplier_value = (
             st.number_input(
                 "楽天SPUポイント倍率",
                 min_value=0,
@@ -1522,11 +2015,19 @@ with st.expander(
                 ),
                 step=1,
                 format="%d",
-                key=f"spu_multiplier_widget_{v}",
+                key=(
+                    f"spu_multiplier_widget_{v}"
+                ),
                 help=(
                     "楽天の商品ごとの還元率に加算します。"
                     "例：3と設定すると+3倍。"
                 ),
+            )
+        )
+
+        st.session_state.spu_multiplier = (
+            int(
+                spu_multiplier_value
             )
         )
 
@@ -1549,9 +2050,11 @@ with st.expander(
 # 商品リスト
 # ===========================================================================
 
+
 st.subheader(
     "商品リスト"
 )
+
 
 items = st.session_state.products
 
@@ -1560,7 +2063,9 @@ for i, item in enumerate(
     items
 ):
 
-    v = st.session_state.widget_version
+    v = (
+        st.session_state.widget_version
+    )
 
     # =======================================================================
     # 商品名・削除
@@ -1578,7 +2083,9 @@ for i, item in enumerate(
             "",
             value=current_name,
             placeholder="商品名",
-            key=f"name_{i}_{v}",
+            key=(
+                f"name_{i}_{v}"
+            ),
             label_visibility="collapsed",
         )
 
@@ -1586,7 +2093,9 @@ for i, item in enumerate(
 
         if st.button(
             "🗑️",
-            key=f"delete_{i}_{v}",
+            key=(
+                f"delete_{i}_{v}"
+            ),
         ):
 
             st.session_state.products.pop(
@@ -1641,11 +2150,13 @@ for i, item in enumerate(
             value=int(
                 item.get(
                     "ap",
-                    0
+                    0,
                 )
             ),
             step=100,
-            key=f"ap_{i}_{v}",
+            key=(
+                f"ap_{i}_{v}"
+            ),
             label_visibility="collapsed",
         )
 
@@ -1664,12 +2175,14 @@ for i, item in enumerate(
             value=int(
                 item.get(
                     "apt",
-                    1
+                    1,
                 )
             ),
             step=1,
             format="%d",
-            key=f"apt_{i}_{v}",
+            key=(
+                f"apt_{i}_{v}"
+            ),
             label_visibility="collapsed",
         )
 
@@ -1679,9 +2192,11 @@ for i, item in enumerate(
             "らくベビ割（10%OFF）",
             value=item.get(
                 "baby",
-                False
+                False,
             ),
-            key=f"baby_{i}_{v}",
+            key=(
+                f"baby_{i}_{v}"
+            ),
         )
 
     # =======================================================================
@@ -1728,11 +2243,13 @@ for i, item in enumerate(
             value=int(
                 item.get(
                     "rp",
-                    0
+                    0,
                 )
             ),
             step=100,
-            key=f"rp_{i}_{v}",
+            key=(
+                f"rp_{i}_{v}"
+            ),
             label_visibility="collapsed",
         )
 
@@ -1751,12 +2268,14 @@ for i, item in enumerate(
             value=int(
                 item.get(
                     "rpt",
-                    0
+                    0,
                 )
             ),
             step=1,
             format="%d",
-            key=f"rpt_{i}_{v}",
+            key=(
+                f"rpt_{i}_{v}"
+            ),
             label_visibility="collapsed",
         )
 
@@ -1766,10 +2285,12 @@ for i, item in enumerate(
             "",
             value=item.get(
                 "rurl",
-                ""
+                "",
             ),
             placeholder="URL",
-            key=f"rurl_{i}_{v}",
+            key=(
+                f"rurl_{i}_{v}"
+            ),
             label_visibility="collapsed",
         )
 
@@ -1777,7 +2298,9 @@ for i, item in enumerate(
 
         if st.button(
             "取得",
-            key=f"get_rakuten_{i}_{v}",
+            key=(
+                f"get_rakuten_{i}_{v}"
+            ),
             use_container_width=True,
         ):
 
@@ -1809,7 +2332,9 @@ for i, item in enumerate(
                     # -------------------------------------------------------
 
                     display_price = int(
-                        round(price)
+                        round(
+                            price
+                        )
                     )
 
                     # -------------------------------------------------------
@@ -1900,6 +2425,7 @@ for i, item in enumerate(
 # 商品追加
 # ===========================================================================
 
+
 col_a, col_b = st.columns(
     2
 )
@@ -1948,13 +2474,21 @@ with col_a:
 # 保存・読み込み
 # ===========================================================================
 
+
 st.subheader(
     "💾 保存・読み込み"
 )
 
-save_col, load_col, file_col = st.columns(
+
+save_col, load_col, info_col = st.columns(
     [2, 2, 4]
 )
+
+
+# ===========================================================================
+# 保存
+# ===========================================================================
+
 
 with save_col:
 
@@ -1967,16 +2501,31 @@ with save_col:
 
             save_data()
 
-            st.success(
-                f"保存しました："
-                f"{SAVE_FILE.name}"
-            )
+            st.session_state[
+                "save_success"
+            ] = True
+
+            st.rerun()
 
         except Exception as e:
 
-            st.error(
+            st.session_state[
+                "save_error"
+            ] = True
+
+            st.session_state[
+                "save_error_message"
+            ] = (
+                f"Google Sheetsへの"
                 f"保存に失敗しました：{e}"
             )
+
+            st.rerun()
+
+
+# ===========================================================================
+# 読み込み
+# ===========================================================================
 
 
 with load_col:
@@ -1986,6 +2535,25 @@ with load_col:
         use_container_width=True,
     ):
 
+        # -------------------------------------------------------------------
+        # ここでは直接load_data()しない。
+        #
+        # ボタンを押した時点では、
+        # Streamlitの現在の画面がまだ生成途中だから。
+        #
+        # load_requested=True
+        # ↓
+        # rerun
+        # ↓
+        # ページ最上部でload_data()
+        # ↓
+        # widget_version変更
+        # ↓
+        # 新しいwidgetを生成
+        #
+        # とする。
+        # -------------------------------------------------------------------
+
         st.session_state[
             "load_requested"
         ] = True
@@ -1993,49 +2561,125 @@ with load_col:
         st.rerun()
 
 
-with file_col:
+# ===========================================================================
+# 保存状態
+# ===========================================================================
 
-    if SAVE_FILE.exists():
 
-        st.caption(
-            f"保存先：{SAVE_FILE}"
+with info_col:
+
+    st.caption(
+        "保存先：Google Sheets"
+    )
+
+    st.caption(
+        "商品データと設定のみ保存されます。"
+        "楽天API認証情報は保存されません。"
+    )
+
+
+# ===========================================================================
+# Google Sheets接続確認
+# ===========================================================================
+
+
+with st.expander(
+    "🔧 Google Sheets接続状態"
+):
+
+    if GOOGLE_SHEET_ID:
+
+        st.success(
+            "GOOGLE_SHEET_ID：設定済み"
         )
 
     else:
 
-        st.caption(
-            f"保存ファイル未作成："
-            f"{SAVE_FILE.name}"
+        st.error(
+            "GOOGLE_SHEET_ID：未設定"
         )
 
+    try:
 
-# ===========================================================================
-# 保存・読み込み結果メッセージ
-# ===========================================================================
-
-if st.session_state.pop(
-    "load_success",
-    False,
-):
-
-    st.success(
-        f"読み込みました："
-        f"{SAVE_FILE.name}"
-    )
-
-
-if "load_error" in st.session_state:
-
-    st.error(
-        st.session_state.pop(
-            "load_error"
+        service_account_info = dict(
+            st.secrets[
+                "gcp_service_account"
+            ]
         )
-    )
+
+        client_email = (
+            service_account_info.get(
+                "client_email",
+                "",
+            )
+        )
+
+        if client_email:
+
+            st.success(
+                "Googleサービスアカウント：設定済み"
+            )
+
+        else:
+
+            st.error(
+                "Googleサービスアカウント："
+                "client_emailがありません"
+            )
+
+    except Exception:
+
+        st.error(
+            "Googleサービスアカウント：未設定"
+        )
+
+    # -----------------------------------------------------------------------
+    # 楽天API
+    # -----------------------------------------------------------------------
+
+    st.divider()
+
+    if RAKUTEN_APP_ID:
+
+        st.success(
+            "楽天 Application ID：設定済み"
+        )
+
+    else:
+
+        st.error(
+            "楽天 Application ID：未設定"
+        )
+
+    if RAKUTEN_ACCESS_KEY:
+
+        st.success(
+            "楽天 Access Key：設定済み"
+        )
+
+    else:
+
+        st.error(
+            "楽天 Access Key：未設定"
+        )
+
+    if RAKUTEN_REFERER:
+
+        st.success(
+            "楽天 Referer：設定済み"
+        )
+
+    else:
+
+        st.error(
+            "楽天 Referer：未設定"
+        )
 
 
 # ===========================================================================
 # 計算
 # ===========================================================================
+
 
 if st.button(
     "🧮 計算する",
@@ -2046,174 +2690,169 @@ if st.button(
     items = st.session_state.products
 
     # -----------------------------------------------------------------------
-    # すべてAmazon
+    # 空の商品を除外
     # -----------------------------------------------------------------------
 
-    all_a = evaluate(
-        items,
-        ["A"] * len(items),
-        st.session_state.max_shops,
-        st.session_state.min_shop_price,
-        st.session_state.bonus_cap,
-        st.session_state.spu_multiplier,
-    )
+    valid_items = []
 
-    # -----------------------------------------------------------------------
-    # すべて楽天
-    # -----------------------------------------------------------------------
+    for item in items:
 
-    all_r = evaluate(
-        items,
-        ["R"] * len(items),
-        st.session_state.max_shops,
-        st.session_state.min_shop_price,
-        st.session_state.bonus_cap,
-        st.session_state.spu_multiplier,
-    )
+        if (
+            str(
+                item.get(
+                    "name",
+                    "",
+                )
+            ).strip()
+            or int(
+                item.get(
+                    "ap",
+                    0,
+                )
+            ) > 0
+            or int(
+                item.get(
+                    "rp",
+                    0,
+                )
+            ) > 0
+            or str(
+                item.get(
+                    "rurl",
+                    "",
+                )
+            ).strip()
+        ):
 
-    # -----------------------------------------------------------------------
-    # 最適な振り分け
-    # -----------------------------------------------------------------------
+            valid_items.append(
+                item
+            )
 
-    best_choices, best = find_best(
-        items,
-        st.session_state.max_shops,
-        st.session_state.min_shop_price,
-        st.session_state.bonus_cap,
-        st.session_state.spu_multiplier,
-    )
+    if not valid_items:
 
-    # -----------------------------------------------------------------------
-    # 商品ごとの結果を計算
-    # -----------------------------------------------------------------------
-
-    item_results = calculate_item_results(
-        items,
-        best_choices,
-        best,
-        st.session_state.spu_multiplier,
-    )
-
-    # -----------------------------------------------------------------------
-    # 結果
-    # -----------------------------------------------------------------------
-
-    st.subheader(
-        "🧮 計算結果"
-    )
-
-    result_col1, result_col2, result_col3 = st.columns(
-        3
-    )
-
-    with result_col1:
-
-        st.metric(
-            "⭐ 最適な振り分け",
-            yen(best["net"]),
+        st.warning(
+            "商品を1つ以上入力してください。"
         )
 
-    with result_col2:
+    else:
 
-        st.metric(
-            "🟧 すべてAmazon",
-            yen(all_a["net"]),
+        items = valid_items
+
+        # -------------------------------------------------------------------
+        # すべてAmazon
+        # -------------------------------------------------------------------
+
+        all_a = evaluate(
+            items,
+            ["A"] * len(items),
+            st.session_state.max_shops,
+            st.session_state.min_shop_price,
+            st.session_state.bonus_cap,
+            st.session_state.spu_multiplier,
         )
 
-    with result_col3:
+        # -------------------------------------------------------------------
+        # すべて楽天
+        # -------------------------------------------------------------------
 
-        st.metric(
-            "🟥 すべて楽天",
-            yen(all_r["net"]),
+        all_r = evaluate(
+            items,
+            ["R"] * len(items),
+            st.session_state.max_shops,
+            st.session_state.min_shop_price,
+            st.session_state.bonus_cap,
+            st.session_state.spu_multiplier,
         )
 
-    # =========================================================================
-    # 商品ごとの購入先
-    # =========================================================================
+        # -------------------------------------------------------------------
+        # 最適な振り分け
+        # -------------------------------------------------------------------
 
-    st.markdown(
-        "### 📦 商品ごとの購入先"
-    )
+        best_choices, best = find_best(
+            items,
+            st.session_state.max_shops,
+            st.session_state.min_shop_price,
+            st.session_state.bonus_cap,
+            st.session_state.spu_multiplier,
+        )
 
-    # -------------------------------------------------------------------------
-    # ヘッダー
-    #
-    # 左から:
-    #   商品名
-    #   購入先
-    #   価格
-    #   還元倍率
-    #   還元ポイント
-    #   実質負担額
-    # -------------------------------------------------------------------------
+        # -------------------------------------------------------------------
+        # 商品ごとの結果を計算
+        # -------------------------------------------------------------------
 
-    (
-        h_name,
-        h_store,
-        h_price,
-        h_multiplier,
-        h_points,
-        h_net,
-    ) = st.columns(
-        [
-            2.4,
-            1.4,
-            1.5,
-            2.1,
-            1.6,
-            1.7,
-        ]
-    )
+        item_results = calculate_item_results(
+            items,
+            best_choices,
+            best,
+            st.session_state.spu_multiplier,
+        )
 
-    with h_name:
+        # -------------------------------------------------------------------
+        # 結果
+        # -------------------------------------------------------------------
+
+        st.subheader(
+            "🧮 計算結果"
+        )
+
+        result_col1, result_col2, result_col3 = (
+            st.columns(3)
+        )
+
+        with result_col1:
+
+            st.metric(
+                "⭐ 最適な振り分け",
+                yen(
+                    best["net"]
+                ),
+            )
+
+        with result_col2:
+
+            st.metric(
+                "🟧 すべてAmazon",
+                yen(
+                    all_a["net"]
+                ),
+            )
+
+        with result_col3:
+
+            st.metric(
+                "🟥 すべて楽天",
+                yen(
+                    all_r["net"]
+                ),
+            )
+
+        # ===================================================================
+        # 商品ごとの購入先
+        # ===================================================================
 
         st.markdown(
-            "**商品名**"
+            "### 📦 商品ごとの購入先"
         )
 
-    with h_store:
-
-        st.markdown(
-            "**購入先**"
-        )
-
-    with h_price:
-
-        st.markdown(
-            "**価格**"
-        )
-
-    with h_multiplier:
-
-        st.markdown(
-            "**還元倍率**"
-        )
-
-    with h_points:
-
-        st.markdown(
-            "**還元ポイント**"
-        )
-
-    with h_net:
-
-        st.markdown(
-            "**実質負担額**"
-        )
-
-    # -------------------------------------------------------------------------
-    # 商品ごとの結果
-    # -------------------------------------------------------------------------
-
-    for result in item_results:
+        # -------------------------------------------------------------------
+        # ヘッダー
+        #
+        # 左から:
+        #   商品名
+        #   購入先
+        #   価格
+        #   還元倍率
+        #   還元ポイント
+        #   実質負担額
+        # -------------------------------------------------------------------
 
         (
-            row_name,
-            row_store,
-            row_price,
-            row_multiplier,
-            row_points,
-            row_net,
+            h_name,
+            h_store,
+            h_price,
+            h_multiplier,
+            h_points,
+            h_net,
         ) = st.columns(
             [
                 2.4,
@@ -2225,202 +2864,262 @@ if st.button(
             ]
         )
 
-        with row_name:
+        with h_name:
 
-            st.write(
-                result["name"]
+            st.markdown(
+                "**商品名**"
             )
 
-        with row_store:
+        with h_store:
 
-            st.write(
-                result["store"]
+            st.markdown(
+                "**購入先**"
             )
 
-        with row_price:
+        with h_price:
 
-            st.write(
-                yen(
-                    result["price"]
+            st.markdown(
+                "**価格**"
+            )
+
+        with h_multiplier:
+
+            st.markdown(
+                "**還元倍率**"
+            )
+
+        with h_points:
+
+            st.markdown(
+                "**還元ポイント**"
+            )
+
+        with h_net:
+
+            st.markdown(
+                "**実質負担額**"
+            )
+
+        # -------------------------------------------------------------------
+        # 商品ごとの結果
+        # -------------------------------------------------------------------
+
+        for result in item_results:
+
+            (
+                row_name,
+                row_store,
+                row_price,
+                row_multiplier,
+                row_points,
+                row_net,
+            ) = st.columns(
+                [
+                    2.4,
+                    1.4,
+                    1.5,
+                    2.1,
+                    1.6,
+                    1.7,
+                ]
+            )
+
+            with row_name:
+
+                st.write(
+                    result["name"]
                 )
-            )
 
-        with row_multiplier:
+            with row_store:
 
-            st.write(
-                result["multiplier"]
-            )
-
-        with row_points:
-
-            st.write(
-                point(
-                    result["points"]
+                st.write(
+                    result["store"]
                 )
-            )
 
-        with row_net:
+            with row_price:
 
-            st.write(
-                yen(
-                    result["net"]
+                st.write(
+                    yen(
+                        result["price"]
+                    )
                 )
-            )
 
-    # =========================================================================
-    # 合計
-    # =========================================================================
+            with row_multiplier:
 
-    st.divider()
+                st.write(
+                    result["multiplier"]
+                )
 
-    (
-        total_name,
-        total_store,
-        total_price,
-        total_multiplier,
-        total_points_col,
-        total_net,
-    ) = st.columns(
-        [
-            2.4,
-            1.4,
-            1.5,
-            2.1,
-            1.6,
-            1.7,
-        ]
-    )
+            with row_points:
 
-    with total_name:
+                st.write(
+                    point(
+                        result["points"]
+                    )
+                )
 
-        st.markdown(
-            "**合計**"
-        )
+            with row_net:
 
-    with total_store:
+                st.write(
+                    yen(
+                        result["net"]
+                    )
+                )
 
-        st.markdown(
-            "**購入額**"
-        )
-
-    with total_price:
-
-        st.markdown(
-            "**"
-            f"{yen(best['amazon_paid'] + best['rakuten_paid'])}"
-            "**"
-        )
-
-    with total_multiplier:
-
-        st.markdown(
-            "**―**"
-        )
-
-    with total_points_col:
-
-        st.markdown(
-            f"**{point(best['total_points'])}**"
-        )
-
-    with total_net:
-
-        st.markdown(
-            f"**{yen(best['net'])}**"
-        )
-
-    # =========================================================================
-    # 詳細計算
-    # =========================================================================
-
-    with st.expander(
-        "📊 詳細な計算内訳"
-    ):
-
-        # ---------------------------------------------------------------------
-        # Amazon
-        # ---------------------------------------------------------------------
-
-        st.markdown(
-            "#### 🟧 Amazon"
-        )
-
-        st.write(
-            f"支払額："
-            f"{yen(best['amazon_paid'])}"
-        )
-
-        st.write(
-            f"Amazonポイント："
-            f"{point(best['amazon_points'])}"
-        )
+        # ===================================================================
+        # 合計
+        # ===================================================================
 
         st.divider()
 
-        # ---------------------------------------------------------------------
-        # 楽天
-        # ---------------------------------------------------------------------
-
-        st.markdown(
-            "#### 🟥 楽天市場"
+        (
+            total_name,
+            total_store,
+            total_price,
+            total_multiplier,
+            total_points_col,
+            total_net,
+        ) = st.columns(
+            [
+                2.4,
+                1.4,
+                1.5,
+                2.1,
+                1.6,
+                1.7,
+            ]
         )
 
-        st.write(
-            f"税込支払額："
-            f"{yen(best['rakuten_paid'])}"
-        )
+        with total_name:
 
-        st.write(
-            f"税抜購入額："
-            f"{yen(best['rakuten_tax_excluded_total'])}"
-        )
+            st.markdown(
+                "**合計**"
+            )
 
-        st.write(
-            f"楽天通常ポイント："
-            f"{point(best['rakuten_base_points'])}"
-        )
+        with total_store:
 
-        st.write(
-            f"楽天SPU："
-            f"+{best['spu_multiplier']}倍"
-        )
+            st.markdown(
+                "**購入額**"
+            )
 
-        st.write(
-            f"買いまわり対象ショップ数："
-            f"{best['shop_count']}"
-        )
+        with total_price:
 
-        st.write(
-            f"買いまわり特典："
-            f"+{best['bonus_multiplier']}倍"
-        )
+            st.markdown(
+                "**"
+                f"{yen(best['amazon_paid'] + best['rakuten_paid'])}"
+                "**"
+            )
 
-        st.write(
-            f"買いまわりポイント："
-            f"{point(best['bonus'])}"
-        )
+        with total_multiplier:
 
-        st.divider()
+            st.markdown(
+                "**―**"
+            )
 
-        # ---------------------------------------------------------------------
-        # 最終結果
-        # ---------------------------------------------------------------------
+        with total_points_col:
 
-        st.markdown(
-            "#### 💰 最終結果"
-        )
+            st.markdown(
+                f"**{point(best['total_points'])}**"
+            )
 
-        st.write(
-            f"支払額合計："
-            f"{yen(best['amazon_paid'] + best['rakuten_paid'])}"
-        )
+        with total_net:
 
-        st.write(
-            f"ポイント合計："
-            f"{point(best['total_points'])}"
-        )
+            st.markdown(
+                f"**{yen(best['net'])}**"
+            )
 
-        st.write(
-            f"**実質負担額："
-            f"{yen(best['net'])}**"
-        )
+        # ===================================================================
+        # 詳細計算
+        # ===================================================================
+
+        with st.expander(
+            "📊 詳細な計算内訳"
+        ):
+
+            # -----------------------------------------------------------------
+            # Amazon
+            # -----------------------------------------------------------------
+
+            st.markdown(
+                "#### 🟧 Amazon"
+            )
+
+            st.write(
+                f"支払額："
+                f"{yen(best['amazon_paid'])}"
+            )
+
+            st.write(
+                f"Amazonポイント："
+                f"{point(best['amazon_points'])}"
+            )
+
+            st.divider()
+
+            # -----------------------------------------------------------------
+            # 楽天
+            # -----------------------------------------------------------------
+
+            st.markdown(
+                "#### 🟥 楽天市場"
+            )
+
+            st.write(
+                f"税込支払額："
+                f"{yen(best['rakuten_paid'])}"
+            )
+
+            st.write(
+                f"税抜購入額："
+                f"{yen(best['rakuten_tax_excluded_total'])}"
+            )
+
+            st.write(
+                f"楽天通常ポイント："
+                f"{point(best['rakuten_base_points'])}"
+            )
+
+            st.write(
+                f"楽天SPU："
+                f"+{best['spu_multiplier']}倍"
+            )
+
+            st.write(
+                f"買いまわり対象ショップ数："
+                f"{best['shop_count']}"
+            )
+
+            st.write(
+                f"買いまわり特典："
+                f"+{best['bonus_multiplier']}倍"
+            )
+
+            st.write(
+                f"買いまわりポイント："
+                f"{point(best['bonus'])}"
+            )
+
+            st.divider()
+
+            # -----------------------------------------------------------------
+            # 最終結果
+            # -----------------------------------------------------------------
+
+            st.markdown(
+                "#### 💰 最終結果"
+            )
+
+            st.write(
+                f"支払額合計："
+                f"{yen(best['amazon_paid'] + best['rakuten_paid'])}"
+            )
+
+            st.write(
+                f"ポイント合計："
+                f"{point(best['total_points'])}"
+            )
+
+            st.write(
+                f"**実質負担額："
+                f"{yen(best['net'])}**"
+            )
