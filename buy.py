@@ -121,8 +121,35 @@ GOOGLE_SCOPES = [
     "https://www.googleapis.com/auth/drive",
 ]
 
+# 保存データは3シートで管理する。
+#
+# saved_data : 保存パターンの一覧
+# products   : 保存パターンごの商品データ
+# settings   : 保存パターンごとの設定値
+#
+# save_idを共通キーにすることで、複数パターンを安全に保存できる。
+
+SAVED_DATA_HEADERS = [
+    "save_id",
+    "name",
+    "saved_at",
+]
+
 PRODUCT_HEADERS = [
-    "name", "ap", "apt", "baby", "rp", "rpt", "rurl"
+    "save_id",
+    "name",
+    "ap",
+    "apt",
+    "baby",
+    "rp",
+    "rpt",
+    "rurl",
+]
+
+SETTING_HEADERS = [
+    "save_id",
+    "setting",
+    "value",
 ]
 
 SETTING_DEFAULTS = {
@@ -132,7 +159,10 @@ SETTING_DEFAULTS = {
     "spu_multiplier": 0,
 }
 
+
 def get_google_credentials():
+    """Streamlit SecretsからGoogleサービスアカウント認証情報を作成する。"""
+
     try:
         info = dict(st.secrets["gcp_service_account"])
     except Exception as e:
@@ -141,10 +171,21 @@ def get_google_credentials():
         ) from e
 
     required = [
-        "type", "project_id", "private_key_id", "private_key",
-        "client_email", "client_id", "token_uri",
+        "type",
+        "project_id",
+        "private_key_id",
+        "private_key",
+        "client_email",
+        "client_id",
+        "token_uri",
     ]
-    missing = [key for key in required if not str(info.get(key, "")).strip()]
+
+    missing = [
+        key
+        for key in required
+        if not str(info.get(key, "")).strip()
+    ]
+
     if missing:
         raise ValueError(
             "gcp_service_accountに必要な項目がありません："
@@ -152,20 +193,32 @@ def get_google_credentials():
         )
 
     private_key = str(info["private_key"])
+
     if "BEGIN PRIVATE KEY" not in private_key:
         raise ValueError(
             "gcp_service_accountのprivate_keyが正しくありません。"
             "Google Cloudから発行した秘密鍵を設定してください。"
         )
 
-    return Credentials.from_service_account_info(
-        info,
-        scopes=GOOGLE_SCOPES,
-    )
+    try:
+        return Credentials.from_service_account_info(
+            info,
+            scopes=GOOGLE_SCOPES,
+        )
+    except Exception as e:
+        raise ValueError(
+            "Googleサービスアカウントの認証に失敗しました。"
+            "Secretsのprivate_key等を確認してください。"
+        ) from e
+
 
 def get_google_spreadsheet():
+    """Google Sheetsを開く。"""
+
     if not GOOGLE_SHEET_ID:
-        raise ValueError("GOOGLE_SHEET_IDが設定されていません。")
+        raise ValueError(
+            "GOOGLE_SHEET_IDが設定されていません。"
+        )
 
     try:
         credentials = get_google_credentials()
@@ -180,7 +233,10 @@ def get_google_spreadsheet():
             "・サービスアカウントに編集権限がある"
         ) from e
 
+
 def get_or_create_worksheet(spreadsheet, title, rows=100, cols=10):
+    """指定したシートを取得し、なければ作成する。"""
+
     try:
         return spreadsheet.worksheet(title)
     except gspread.WorksheetNotFound:
@@ -190,132 +246,591 @@ def get_or_create_worksheet(spreadsheet, title, rows=100, cols=10):
             cols=cols,
         )
 
+
+def ensure_worksheet_size(ws, rows, cols):
+    """Google Sheetsのグリッドサイズを必要な大きさ以上にする。"""
+
+    try:
+        current_rows = int(ws.row_count)
+        current_cols = int(ws.col_count)
+    except Exception:
+        current_rows = 0
+        current_cols = 0
+
+    target_rows = max(current_rows, rows, 10)
+    target_cols = max(current_cols, cols, 2)
+
+    if current_rows < target_rows or current_cols < target_cols:
+        ws.resize(
+            rows=target_rows,
+            cols=target_cols,
+        )
+
+
 def normalize_bool(value):
     if isinstance(value, bool):
         return value
-    return str(value).strip().lower() in {"true", "1", "yes", "on"}
 
-def create_google_sheet_data():
-    products = []
+    return str(value).strip().lower() in {
+        "true",
+        "1",
+        "yes",
+        "on",
+    }
+
+
+def safe_int(value, default=0):
+    """Google Sheetsから取得した値を安全に整数へ変換する。"""
+
+    try:
+        if value is None or str(value).strip() == "":
+            return int(default)
+        return int(float(value))
+    except (TypeError, ValueError):
+        return int(default)
+
+
+def make_default_product():
+    """新規商品の初期値。"""
+
+    return {
+        "name": "",
+        "ap": 0,
+        "apt": 1,
+        "baby": False,
+        "rp": 0,
+        "rpt": 0,
+        "rurl": "",
+    }
+
+
+def get_current_products_for_save():
+    """現在の画面の商品の保存用データを作る。"""
+
+    result = []
+
     for item in st.session_state.products:
-        products.append([
+        result.append({
+            "name": str(item.get("name", "")),
+            "ap": safe_int(item.get("ap", 0)),
+            "apt": safe_int(item.get("apt", 1), 1),
+            "baby": bool(item.get("baby", False)),
+            "rp": safe_int(item.get("rp", 0)),
+            "rpt": safe_int(item.get("rpt", 0)),
+            "rurl": str(item.get("rurl", "")),
+        })
+
+    return result
+
+
+def get_current_settings_for_save():
+    """現在の画面の設定値を保存用辞書にする。"""
+
+    return {
+        "max_shops": safe_int(
+            st.session_state.get("max_shops", 10),
+            10,
+        ),
+        "min_shop_price": safe_int(
+            st.session_state.get("min_shop_price", 1000),
+            1000,
+        ),
+        "bonus_cap": safe_int(
+            st.session_state.get("bonus_cap", 7000),
+            7000,
+        ),
+        "spu_multiplier": safe_int(
+            st.session_state.get("spu_multiplier", 0),
+            0,
+        ),
+    }
+
+
+def read_saved_data_list(spreadsheet):
+    """保存パターン一覧を返す。"""
+
+    ws = get_or_create_worksheet(
+        spreadsheet,
+        "saved_data",
+        rows=100,
+        cols=len(SAVED_DATA_HEADERS),
+    )
+
+    values = ws.get_all_values()
+    records = []
+
+    if not values:
+        return records
+
+    header = [str(x).strip() for x in values[0]]
+
+    try:
+        indexes = {
+            name: header.index(name)
+            for name in SAVED_DATA_HEADERS
+        }
+    except ValueError:
+        return records
+
+    for row in values[1:]:
+        def cell(name):
+            idx = indexes[name]
+            return row[idx] if idx < len(row) else ""
+
+        save_id = str(cell("save_id")).strip()
+        name = str(cell("name")).strip()
+
+        if not save_id or not name:
+            continue
+
+        records.append({
+            "save_id": save_id,
+            "name": name,
+            "saved_at": str(cell("saved_at")).strip(),
+        })
+
+    return records
+
+
+def write_saved_data_list(spreadsheet, records):
+    """保存パターン一覧を書き込む。"""
+
+    ws = get_or_create_worksheet(
+        spreadsheet,
+        "saved_data",
+        rows=100,
+        cols=len(SAVED_DATA_HEADERS),
+    )
+
+    values = [SAVED_DATA_HEADERS]
+
+    for record in records:
+        values.append([
+            record.get("save_id", ""),
+            record.get("name", ""),
+            record.get("saved_at", ""),
+        ])
+
+    ensure_worksheet_size(
+        ws,
+        max(100, len(values) + 5),
+        len(SAVED_DATA_HEADERS),
+    )
+
+    ws.clear()
+    ws.update(
+        "A1",
+        values,
+        value_input_option="USER_ENTERED",
+    )
+
+
+def write_products_for_save(spreadsheet, save_id, products):
+    """指定save_idの商品データを書き込む。"""
+
+    ws = get_or_create_worksheet(
+        spreadsheet,
+        "products",
+        rows=200,
+        cols=len(PRODUCT_HEADERS),
+    )
+
+    values = [PRODUCT_HEADERS]
+
+    for item in products:
+        values.append([
+            save_id,
             item.get("name", ""),
-            int(item.get("ap", 0)),
-            int(item.get("apt", 1)),
+            safe_int(item.get("ap", 0)),
+            safe_int(item.get("apt", 1), 1),
             bool(item.get("baby", False)),
-            int(item.get("rp", 0)),
-            int(item.get("rpt", 0)),
+            safe_int(item.get("rp", 0)),
+            safe_int(item.get("rpt", 0)),
             item.get("rurl", ""),
         ])
 
-    settings = [
-        ["setting", "value"],
-        ["max_shops", int(st.session_state.max_shops)],
-        ["min_shop_price", int(st.session_state.min_shop_price)],
-        ["bonus_cap", int(st.session_state.bonus_cap)],
-        ["spu_multiplier", int(st.session_state.spu_multiplier)],
-    ]
-    return products, settings
+    ensure_worksheet_size(
+        ws,
+        max(200, len(values) + 5),
+        len(PRODUCT_HEADERS),
+    )
 
-def save_data_to_google_sheets():
+    existing = ws.get_all_values()
+
+    if existing:
+        header = [str(x).strip() for x in existing[0]]
+    else:
+        header = []
+
+    # 現在の新形式でなければ、既存の旧データを一度新形式へ移行する。
+    old_rows = []
+
+    if header == PRODUCT_HEADERS:
+        for row in existing[1:]:
+            if not row:
+                continue
+            row_save_id = row[0].strip() if len(row) > 0 else ""
+            if row_save_id and row_save_id != save_id:
+                old_rows.append(row[:len(PRODUCT_HEADERS)])
+
+    final_values = [PRODUCT_HEADERS] + old_rows + values[1:]
+
+    ws.clear()
+    ws.update(
+        "A1",
+        final_values,
+        value_input_option="USER_ENTERED",
+    )
+
+
+def write_settings_for_save(spreadsheet, save_id, settings):
+    """指定save_idの設定データを書き込む。"""
+
+    ws = get_or_create_worksheet(
+        spreadsheet,
+        "settings",
+        rows=100,
+        cols=len(SETTING_HEADERS),
+    )
+
+    existing = ws.get_all_values()
+
+    old_rows = []
+
+    if existing:
+        header = [str(x).strip() for x in existing[0]]
+
+        if header == SETTING_HEADERS:
+            for row in existing[1:]:
+                if not row:
+                    continue
+                row_save_id = row[0].strip() if len(row) > 0 else ""
+                if row_save_id and row_save_id != save_id:
+                    old_rows.append(row[:len(SETTING_HEADERS)])
+
+    new_rows = []
+
+    for key in (
+        "max_shops",
+        "min_shop_price",
+        "bonus_cap",
+        "spu_multiplier",
+    ):
+        new_rows.append([
+            save_id,
+            key,
+            safe_int(settings.get(key), SETTING_DEFAULTS[key]),
+        ])
+
+    final_values = [SETTING_HEADERS] + old_rows + new_rows
+
+    ensure_worksheet_size(
+        ws,
+        max(100, len(final_values) + 5),
+        len(SETTING_HEADERS),
+    )
+
+    ws.clear()
+    ws.update(
+        "A1",
+        final_values,
+        value_input_option="USER_ENTERED",
+    )
+
+
+def save_named_data_to_google_sheets(save_name, overwrite_save_id=None):
+    """現在の画面を指定した名前で保存する。"""
+
+    save_name = str(save_name).strip()
+
+    if not save_name:
+        raise ValueError("保存名を入力してください。")
+
+    if len(save_name) > 50:
+        raise ValueError("保存名は50文字以内で入力してください。")
+
     spreadsheet = get_google_spreadsheet()
+    records = read_saved_data_list(spreadsheet)
+
+    # 同名の保存データがあれば、そのIDを使って上書きできる。
+    target_id = overwrite_save_id
+
+    if not target_id:
+        same_name = [
+            r for r in records
+            if r["name"] == save_name
+        ]
+        if same_name:
+            target_id = same_name[0]["save_id"]
+
+    if not target_id:
+        import uuid
+        target_id = uuid.uuid4().hex
+
+    from datetime import datetime
+
+    saved_at = datetime.now().strftime(
+        "%Y-%m-%d %H:%M:%S"
+    )
+
+    updated = False
+
+    for record in records:
+        if record["save_id"] == target_id:
+            record["name"] = save_name
+            record["saved_at"] = saved_at
+            updated = True
+            break
+
+    if not updated:
+        records.append({
+            "save_id": target_id,
+            "name": save_name,
+            "saved_at": saved_at,
+        })
+
+    write_saved_data_list(
+        spreadsheet,
+        records,
+    )
+
+    write_products_for_save(
+        spreadsheet,
+        target_id,
+        get_current_products_for_save(),
+    )
+
+    write_settings_for_save(
+        spreadsheet,
+        target_id,
+        get_current_settings_for_save(),
+    )
+
+    st.session_state.current_save_id = target_id
+    st.session_state.current_save_name = save_name
+
+
+def load_named_data_from_google_sheets(save_id):
+    """指定save_idの保存データを読み込む。"""
+
+    if not save_id:
+        raise ValueError("読み込む保存データを選択してください。")
+
+    spreadsheet = get_google_spreadsheet()
+    records = read_saved_data_list(spreadsheet)
+
+    target = next(
+        (
+            record
+            for record in records
+            if record["save_id"] == save_id
+        ),
+        None,
+    )
+
+    if target is None:
+        raise ValueError(
+            "指定された保存データが見つかりません。"
+        )
+
+    # -----------------------------------------------------------------------
+    # 商品
+    # -----------------------------------------------------------------------
+
     products_ws = get_or_create_worksheet(
-        spreadsheet, "products", rows=100, cols=len(PRODUCT_HEADERS)
-    )
-    settings_ws = get_or_create_worksheet(
-        spreadsheet, "settings", rows=20, cols=2
-    )
-
-    products, settings = create_google_sheet_data()
-
-    product_values = [PRODUCT_HEADERS] + products
-    products_ws.clear()
-    products_ws.resize(
-        rows=max(100, len(product_values) + 5),
+        spreadsheet,
+        "products",
+        rows=200,
         cols=len(PRODUCT_HEADERS),
     )
-    products_ws.update(
-        "A1",
-        product_values,
-        value_input_option="USER_ENTERED",
-    )
 
-    settings_ws.clear()
-    settings_ws.resize(rows=20, cols=2)
-    settings_ws.update(
-        "A1",
-        settings,
-        value_input_option="USER_ENTERED",
-    )
+    product_values = products_ws.get_all_values()
+    loaded_products = []
 
-def load_data_from_google_sheets():
-    spreadsheet = get_google_spreadsheet()
+    if product_values:
+        header = [str(x).strip() for x in product_values[0]]
 
-    products_ws = get_or_create_worksheet(
-        spreadsheet, "products", rows=100, cols=len(PRODUCT_HEADERS)
-    )
+        try:
+            indexes = {
+                name: header.index(name)
+                for name in PRODUCT_HEADERS
+            }
+        except ValueError:
+            indexes = None
+
+        if indexes is not None:
+            for row in product_values[1:]:
+                def cell(name, default=""):
+                    idx = indexes[name]
+                    return row[idx] if idx < len(row) else default
+
+                if str(cell("save_id")).strip() != save_id:
+                    continue
+
+                if not any(
+                    str(cell(name)).strip()
+                    for name in PRODUCT_HEADERS[1:]
+                ):
+                    continue
+
+                loaded_products.append({
+                    "name": cell("name", ""),
+                    "ap": safe_int(cell("ap", 0)),
+                    "apt": safe_int(cell("apt", 1), 1),
+                    "baby": normalize_bool(cell("baby", False)),
+                    "rp": safe_int(cell("rp", 0)),
+                    "rpt": safe_int(cell("rpt", 0)),
+                    "rurl": cell("rurl", ""),
+                })
+
+    if not loaded_products:
+        loaded_products = [make_default_product()]
+
+    # -----------------------------------------------------------------------
+    # 設定
+    # -----------------------------------------------------------------------
+
     settings_ws = get_or_create_worksheet(
-        spreadsheet, "settings", rows=20, cols=2
+        spreadsheet,
+        "settings",
+        rows=100,
+        cols=len(SETTING_HEADERS),
     )
 
-    # 設定は「setting,value」の見出しに依存せず読み込む
     setting_map = dict(SETTING_DEFAULTS)
-    for row in settings_ws.get_all_values():
-        if len(row) >= 2 and row[0] in SETTING_DEFAULTS:
-            try:
-                setting_map[row[0]] = int(float(row[1]))
-            except (TypeError, ValueError):
-                pass
+    setting_values = settings_ws.get_all_values()
 
+    if setting_values:
+        header = [str(x).strip() for x in setting_values[0]]
+
+        try:
+            indexes = {
+                name: header.index(name)
+                for name in SETTING_HEADERS
+            }
+        except ValueError:
+            indexes = None
+
+        if indexes is not None:
+            for row in setting_values[1:]:
+                def cell(name, default=""):
+                    idx = indexes[name]
+                    return row[idx] if idx < len(row) else default
+
+                if str(cell("save_id")).strip() != save_id:
+                    continue
+
+                key = str(cell("setting")).strip()
+
+                if key in SETTING_DEFAULTS:
+                    setting_map[key] = safe_int(
+                        cell("value"),
+                        SETTING_DEFAULTS[key],
+                    )
+
+    st.session_state.products = loaded_products
     st.session_state.max_shops = setting_map["max_shops"]
     st.session_state.min_shop_price = setting_map["min_shop_price"]
     st.session_state.bonus_cap = setting_map["bonus_cap"]
     st.session_state.spu_multiplier = setting_map["spu_multiplier"]
 
-    values = products_ws.get_all_values()
-    loaded_products = []
-
-    if values:
-        header = [str(x).strip() for x in values[0]]
-        try:
-            indexes = {name: header.index(name) for name in PRODUCT_HEADERS}
-        except ValueError:
-            indexes = None
-
-        if indexes is not None:
-            for row in values[1:]:
-                if not any(str(x).strip() for x in row):
-                    continue
-                def cell(name, default=""):
-                    idx = indexes[name]
-                    return row[idx] if idx < len(row) else default
-                loaded_products.append({
-                    "name": cell("name", ""),
-                    "ap": int(float(cell("ap", 0) or 0)),
-                    "apt": int(float(cell("apt", 1) or 1)),
-                    "baby": normalize_bool(cell("baby", False)),
-                    "rp": int(float(cell("rp", 0) or 0)),
-                    "rpt": int(float(cell("rpt", 0) or 0)),
-                    "rurl": cell("rurl", ""),
-                })
-
-    if loaded_products:
-        st.session_state.products = loaded_products
-    else:
-        st.session_state.products = [{
-            "name": "",
-            "ap": 0,
-            "apt": 1,
-            "baby": False,
-            "rp": 0,
-            "rpt": 0,
-            "rurl": "",
-        }]
+    st.session_state.current_save_id = target["save_id"]
+    st.session_state.current_save_name = target["name"]
+    st.session_state.selected_saved_data_id = target["save_id"]
 
     st.session_state.widget_version = (
         int(st.session_state.get("widget_version", 0)) + 1
     )
 
+
+def delete_named_data_from_google_sheets(save_id):
+    """指定save_idの保存データを削除する。"""
+
+    if not save_id:
+        raise ValueError("削除する保存データを選択してください。")
+
+    spreadsheet = get_google_spreadsheet()
+    records = read_saved_data_list(spreadsheet)
+
+    target = next(
+        (
+            record
+            for record in records
+            if record["save_id"] == save_id
+        ),
+        None,
+    )
+
+    if target is None:
+        raise ValueError("削除する保存データが見つかりません。")
+
+    remaining = [
+        record
+        for record in records
+        if record["save_id"] != save_id
+    ]
+
+    write_saved_data_list(
+        spreadsheet,
+        remaining,
+    )
+
+    # products / settingsからも対象IDの行を削除する。
+    for sheet_name, headers in (
+        ("products", PRODUCT_HEADERS),
+        ("settings", SETTING_HEADERS),
+    ):
+        ws = get_or_create_worksheet(
+            spreadsheet,
+            sheet_name,
+            rows=100,
+            cols=len(headers),
+        )
+
+        values = ws.get_all_values()
+
+        if not values:
+            continue
+
+        header = [str(x).strip() for x in values[0]]
+
+        if header != headers:
+            continue
+
+        keep = [values[0]]
+
+        for row in values[1:]:
+            row_save_id = row[0].strip() if row else ""
+            if row_save_id != save_id:
+                keep.append(row)
+
+        ws.clear()
+        ws.update(
+            "A1",
+            keep,
+            value_input_option="USER_ENTERED",
+        )
+
+    if st.session_state.get("current_save_id") == save_id:
+        st.session_state.current_save_id = ""
+        st.session_state.current_save_name = ""
+
+    remaining_ids = [
+        record["save_id"]
+        for record in remaining
+    ]
+
+    if st.session_state.get("selected_saved_data_id") == save_id:
+        st.session_state.selected_saved_data_id = (
+            remaining_ids[0] if remaining_ids else ""
+        )
+
+
+def get_saved_data_options():
+    """画面表示用の保存パターン一覧を取得する。"""
+
+    spreadsheet = get_google_spreadsheet()
+    return read_saved_data_list(spreadsheet)
 
 # ===========================================================================
 # 楽天API
@@ -1263,22 +1778,57 @@ def calculate_item_results(
 
 
 # ===========================================================================
-# 保存・読み込み
+# 保存・読み込み処理（ウィジェット生成前）
 # ===========================================================================
 
-# Google Sheetsの読み込みはウィジェット生成前に実行する。
-# これにより、読み込んだ値がそのまま画面の入力欄に反映される。
-if st.session_state.pop("load_requested", False):
+# 読み込み・削除は、ボタンを押した直後にrerunし、次の実行の先頭で
+# session_stateへ反映する。これによりStreamlitのウィジェットキーと
+# 読み込んだ値が衝突しない。
+
+if st.session_state.pop("pending_load_save_id", ""):
+    pending_id = st.session_state.pop(
+        "_pending_load_save_id_value",
+        "",
+    )
+
     try:
-        load_data_from_google_sheets()
+        load_named_data_from_google_sheets(
+            pending_id
+        )
         st.session_state["google_sheet_message"] = (
-            "success", "Google Sheetsから設定を読み込みました。"
+            "success",
+            "Google Sheetsから設定を読み込みました。",
         )
     except Exception as e:
         st.session_state["google_sheet_message"] = (
-            "error", f"Google Sheetsからの読み込みに失敗しました：{e}"
+            "error",
+            f"Google Sheetsからの読み込みに失敗しました：{e}",
         )
 
+
+if (
+    st.session_state.get("pending_delete_save_id", False)
+    and st.session_state.pop("pending_delete_confirmed", False)
+):
+    pending_id = st.session_state.pop(
+        "_pending_delete_save_id_value",
+        "",
+    )
+    st.session_state.pop("pending_delete_save_id", None)
+
+    try:
+        delete_named_data_from_google_sheets(
+            pending_id
+        )
+        st.session_state["google_sheet_message"] = (
+            "success",
+            "保存データを削除しました。",
+        )
+    except Exception as e:
+        st.session_state["google_sheet_message"] = (
+            "error",
+            f"保存データの削除に失敗しました：{e}",
+        )
 
 # ===========================================================================
 # 初期値
@@ -1313,6 +1863,26 @@ if "products" not in st.session_state:
 if "widget_version" not in st.session_state:
 
     st.session_state.widget_version = 0
+
+
+if "current_save_id" not in st.session_state:
+
+    st.session_state.current_save_id = ""
+
+
+if "current_save_name" not in st.session_state:
+
+    st.session_state.current_save_name = ""
+
+
+if "saved_data_records" not in st.session_state:
+
+    st.session_state.saved_data_records = []
+
+
+if "selected_saved_data_id" not in st.session_state:
+
+    st.session_state.selected_saved_data_id = ""
 
 
 if "max_shops" not in st.session_state:
@@ -1856,42 +2426,361 @@ st.subheader(
     "💾 保存・読み込み"
 )
 
-save_col, load_col, info_col = st.columns(
-    [2, 2, 4]
+# 保存一覧の取得は、画面表示時に行う。
+# APIエラーが起きても商品入力画面そのものは使えるようにする。
+try:
+    saved_records = get_saved_data_options()
+    st.session_state.saved_data_records = saved_records
+    saved_data_error = ""
+except Exception as e:
+    saved_records = st.session_state.get(
+        "saved_data_records",
+        [],
+    )
+    saved_data_error = str(e)
+
+current_save_name = st.session_state.get(
+    "current_save_name",
+    "",
 )
 
-with save_col:
-    if st.button(
-        "💾 現在の設定を保存",
-        use_container_width=True,
-    ):
-        try:
-            save_data_to_google_sheets()
-            st.session_state["google_sheet_message"] = (
-                "success", "Google Sheetsへ保存しました。"
-            )
-        except Exception as e:
-            st.session_state["google_sheet_message"] = (
-                "error", f"Google Sheetsへの保存に失敗しました：{e}"
-            )
+if current_save_name:
+    st.caption(
+        f"現在の保存データ：**{current_save_name}**"
+    )
+else:
+    st.caption(
+        "現在の画面の設定は、まだ保存されていません。"
+    )
 
-with load_col:
-    if st.button(
-        "📂 保存データを読み込む",
+# ---------------------------------------------------------------------------
+# 保存
+# ---------------------------------------------------------------------------
+
+save_name_col, save_button_col = st.columns(
+    [4, 1]
+)
+
+with save_name_col:
+    save_name = st.text_input(
+        "保存名",
+        value=current_save_name,
+        placeholder="例：日用品まとめ買い",
+        max_chars=50,
+    )
+
+with save_button_col:
+    st.write("")
+    save_clicked = st.button(
+        "💾 保存",
         use_container_width=True,
-    ):
-        st.session_state["load_requested"] = True
+    )
+
+if save_clicked:
+    save_name = save_name.strip()
+
+    if not save_name:
+        st.session_state["google_sheet_message"] = (
+            "warning",
+            "保存名を入力してください。",
+        )
         st.rerun()
 
-with info_col:
-    st.caption(
-        "保存先：Google Sheets"
+    try:
+        # 同名保存データの確認。
+        matching_record = next(
+            (
+                record
+                for record in saved_records
+                if record["name"] == save_name
+            ),
+            None,
+        )
+
+        current_id = st.session_state.get(
+            "current_save_id",
+            "",
+        )
+
+        # 現在読み込んでいる保存データ自身なら、そのまま上書きする。
+        if matching_record and matching_record["save_id"] == current_id:
+            try:
+                save_named_data_to_google_sheets(
+                    save_name,
+                    overwrite_save_id=current_id,
+                )
+                st.session_state["google_sheet_message"] = (
+                    "success",
+                    f"Google Sheetsの「{save_name}」を上書き保存しました。",
+                )
+                st.rerun()
+            except Exception as e:
+                st.session_state["google_sheet_message"] = (
+                    "error",
+                    f"Google Sheetsへの保存に失敗しました：{e}",
+                )
+                st.rerun()
+
+        # 別のデータと同名なら確認を表示する。
+        if matching_record:
+            st.session_state["pending_save"] = {
+                "name": save_name,
+                "save_id": matching_record["save_id"],
+            }
+            st.session_state["pending_save_confirmed"] = False
+            st.rerun()
+
+        # 新規保存
+        save_named_data_to_google_sheets(
+            save_name,
+            overwrite_save_id=None,
+        )
+
+        st.session_state["google_sheet_message"] = (
+            "success",
+            f"Google Sheetsへ「{save_name}」を保存しました。",
+        )
+
+        st.rerun()
+
+    except Exception as e:
+        st.session_state["google_sheet_message"] = (
+            "error",
+            f"Google Sheetsへの保存に失敗しました：{e}",
+        )
+        st.rerun()
+
+# ---------------------------------------------------------------------------
+# 同名保存の上書き確認
+# ---------------------------------------------------------------------------
+
+pending_save = st.session_state.get(
+    "pending_save"
+)
+
+if (
+    pending_save
+    and not st.session_state.get(
+        "pending_save_confirmed",
+        False,
     )
-    st.caption(
-        "楽天APIの認証情報はGoogle Sheetsには保存されません。"
+):
+    st.warning(
+        f"「{pending_save['name']}」は既に保存されています。"
+        "この保存データを上書きしますか？"
     )
 
-# Google Sheets関連メッセージは、保存・読み込みボタンの直下に表示する。
+    overwrite_col, cancel_col = st.columns(2)
+
+    with overwrite_col:
+        if st.button(
+            "上書きする",
+            type="primary",
+            use_container_width=True,
+            key="confirm_overwrite_save",
+        ):
+            try:
+                save_named_data_to_google_sheets(
+                    pending_save["name"],
+                    overwrite_save_id=pending_save["save_id"],
+                )
+
+                st.session_state.pop("pending_save", None)
+                st.session_state.pop(
+                    "pending_save_confirmed",
+                    None,
+                )
+
+                st.session_state["google_sheet_message"] = (
+                    "success",
+                    f"Google Sheetsの「{pending_save['name']}」を上書き保存しました。",
+                )
+                st.rerun()
+
+            except Exception as e:
+                st.session_state["google_sheet_message"] = (
+                    "error",
+                    f"Google Sheetsへの保存に失敗しました：{e}",
+                )
+                st.rerun()
+
+    with cancel_col:
+        if st.button(
+            "キャンセル",
+            use_container_width=True,
+            key="cancel_overwrite_save",
+        ):
+            st.session_state.pop("pending_save", None)
+            st.session_state.pop(
+                "pending_save_confirmed",
+                None,
+            )
+            st.rerun()
+
+# ---------------------------------------------------------------------------
+# 保存データ一覧
+# ---------------------------------------------------------------------------
+
+if saved_records:
+    option_ids = [
+        record["save_id"]
+        for record in saved_records
+    ]
+
+    current_id = st.session_state.get(
+        "current_save_id",
+        "",
+    )
+
+    # selectboxは行番号ではなくsave_idを状態として持たせる。
+    # 削除後に一覧の行数が変わっても、古いindexが残ってエラーにならない。
+    selected_state = st.session_state.get(
+        "selected_saved_data_id",
+        "",
+    )
+
+    if selected_state not in option_ids:
+        selected_state = (
+            current_id
+            if current_id in option_ids
+            else option_ids[0]
+        )
+        st.session_state.selected_saved_data_id = selected_state
+
+    def saved_option_label(save_id):
+        record = next(
+            record
+            for record in saved_records
+            if record["save_id"] == save_id
+        )
+        if record.get("saved_at"):
+            return f"{record['name']}（{record['saved_at']}）"
+        return record["name"]
+
+    selected_save_id = st.selectbox(
+        "保存済みデータ",
+        options=option_ids,
+        format_func=saved_option_label,
+        key="selected_saved_data_id",
+    )
+
+    selected_save_record = next(
+        record
+        for record in saved_records
+        if record["save_id"] == selected_save_id
+    )
+    selected_save_name = selected_save_record["name"]
+
+    load_col, delete_col = st.columns(2)
+
+    with load_col:
+        if st.button(
+            "📂 選択したデータを読み込む",
+            use_container_width=True,
+            key="load_selected_save",
+        ):
+            st.session_state["_pending_load_save_id_value"] = selected_save_id
+            st.session_state["pending_load_save_id"] = True
+            st.rerun()
+
+    with delete_col:
+        if st.button(
+            "🗑️ 選択したデータを削除",
+            use_container_width=True,
+            key="delete_selected_save",
+        ):
+            st.session_state["pending_delete_save_id"] = True
+            st.session_state["pending_delete_confirmed"] = False
+            st.session_state["_pending_delete_save_id_value"] = selected_save_id
+            st.rerun()
+
+    # -----------------------------------------------------------------------
+    # 削除確認
+    # -----------------------------------------------------------------------
+
+    if st.session_state.get("pending_delete_save_id"):
+        pending_delete_id = st.session_state.get(
+            "_pending_delete_save_id_value",
+            "",
+        )
+
+        pending_delete_record = next(
+            (
+                record
+                for record in saved_records
+                if record["save_id"] == pending_delete_id
+            ),
+            None,
+        )
+
+        if pending_delete_record:
+            st.warning(
+                f"「{pending_delete_record['name']}」を削除しますか？"
+                "この操作は元に戻せません。"
+            )
+
+            confirm_delete_col, cancel_delete_col = st.columns(2)
+
+            with confirm_delete_col:
+                if st.button(
+                    "削除する",
+                    type="primary",
+                    use_container_width=True,
+                    key="confirm_delete_save",
+                ):
+                    st.session_state["pending_delete_confirmed"] = True
+                    st.rerun()
+
+            with cancel_delete_col:
+                if st.button(
+                    "キャンセル",
+                    use_container_width=True,
+                    key="cancel_delete_save",
+                ):
+                    st.session_state.pop(
+                        "pending_delete_save_id",
+                        None,
+                    )
+                    st.session_state.pop(
+                        "pending_delete_confirmed",
+                        None,
+                    )
+                    st.session_state.pop(
+                        "_pending_delete_save_id_value",
+                        None,
+                    )
+                    st.rerun()
+        else:
+            st.session_state.pop(
+                "pending_delete_save_id",
+                None,
+            )
+            st.session_state.pop(
+                "pending_delete_confirmed",
+                None,
+            )
+            st.session_state.pop(
+                "_pending_delete_save_id_value",
+                None,
+            )
+
+else:
+    if saved_data_error:
+        st.caption(
+            "保存済みデータを取得できませんでした。"
+            "Google Sheetsの接続設定を確認してください。"
+        )
+    else:
+        st.info(
+            "保存済みデータはありません。"
+            "保存名を入力して「💾 保存」を押してください。"
+        )
+
+# ---------------------------------------------------------------------------
+# Google Sheets関連メッセージ
+# ---------------------------------------------------------------------------
+# 保存・読み込みエリアの直下にだけ表示する。
+
 google_sheet_message = st.session_state.pop(
     "google_sheet_message",
     None,
@@ -1899,6 +2788,7 @@ google_sheet_message = st.session_state.pop(
 
 if google_sheet_message:
     message_type, message_text = google_sheet_message
+
     if message_type == "success":
         st.success(message_text)
     elif message_type == "warning":
@@ -1906,6 +2796,12 @@ if google_sheet_message:
     else:
         st.error(message_text)
 
+st.caption(
+    "保存先：Google Sheets"
+)
+st.caption(
+    "楽天APIの認証情報はGoogle Sheetsには保存されません。"
+)
 
 # ===========================================================================
 # 計算
