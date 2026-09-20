@@ -20,6 +20,7 @@ Streamlit Cloud の Secrets に以下を設定:
 
 
 import os
+import json
 import re
 import urllib.parse
 import urllib.request
